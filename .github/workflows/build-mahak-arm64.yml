@@ -1,0 +1,249 @@
+name: Build arm64 (Mahak)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Version and release tag (empty = artifact only)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      RUST_TOOLCHAIN: "stable"
+      GO_VERSION: "1.26"
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+      with:
+        submodules: 'recursive'
+        fetch-depth: '0'
+
+    - name: Checkout Mahak sources
+      uses: actions/checkout@v7
+      with:
+        repository: abolfazlkakavand/mahak
+        ref: main
+        path: mahak-src
+
+    - name: Build for arm64-v8a only
+      run: |
+        # Every compile script lists the ABIs it builds; keep arm64-v8a. A script that names them
+        # differently is left alone and builds all of them, which only costs time.
+        sed -i -E 's/^ABIS=.*/ABIS="arm64-v8a"/' compile-aether.sh compile-pt.sh compile-psiphon.sh compile-hevtun.sh || true
+
+    - name: Hook Mahak into the core service
+      run: |
+        f=V2rayNG/app/src/main/java/com/v2ray/ang/core/CoreServiceManager.kt
+        if ! grep -q "MahakSidecar" "$f"; then
+          sed -i 's/AetherCoreManager\.stop()$/AetherCoreManager.stop(); MahakSidecar.stop()/' "$f"
+          sed -i 's/^\([[:space:]]*\)coreController\.startLoop(content, tunFd)$/\1MahakSidecar.start(service, content)\n\1coreController.startLoop(content, tunFd)/' "$f"
+        fi
+        test "$(grep -c 'MahakSidecar.stop()' "$f")" -ge 4
+        grep -q 'MahakSidecar.start(service, content)' "$f"
+        grep -n 'MahakSidecar' "$f"
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v4
+      with:
+        log-accepted-android-sdk-licenses: false
+        cmdline-tools-version: '14742923'
+        packages: 'platforms;android-37.0 build-tools;37.0.0 platform-tools'
+
+    - name: Install NDK
+      run: |
+        echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+          --channel=0 \
+          --install "ndk;30.0.16248370"
+        echo "NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> $GITHUB_ENV
+        sed -i '10i\
+        \
+            ndkVersion = "30.0.16248370"' ${{ github.workspace }}/V2rayNG/app/build.gradle.kts
+
+    - name: Restore cached libhevtun
+      id: cache-libhevtun-restore
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ github.workspace }}/libs
+        key: arm64-libhevtun-${{ runner.os }}-${{ env.NDK_HOME }}-${{ hashFiles('.git/modules/hev-socks5-tunnel/HEAD') }}-${{ hashFiles('compile-hevtun.sh') }}
+
+    - name: Build libhevtun
+      if: steps.cache-libhevtun-restore.outputs.cache-hit != 'true'
+      run: |
+        bash compile-hevtun.sh
+
+    - name: Save libhevtun
+      if: steps.cache-libhevtun-restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ github.workspace }}/libs
+        key: arm64-libhevtun-${{ runner.os }}-${{ env.NDK_HOME }}-${{ hashFiles('.git/modules/hev-socks5-tunnel/HEAD') }}-${{ hashFiles('compile-hevtun.sh') }}
+
+    - name: Install Rust
+      id: rust-toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ env.RUST_TOOLCHAIN }}
+        targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+    - name: Restore cached libaether
+      id: cache-libaether-restore
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ github.workspace }}/libs-aether
+        key: arm64-libaether-${{ runner.os }}-${{ env.NDK_HOME }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('.git/modules/aether/HEAD') }}-${{ hashFiles('compile-aether.sh') }}
+
+    - name: Build libaether
+      if: steps.cache-libaether-restore.outputs.cache-hit != 'true'
+      run: |
+        bash compile-aether.sh
+
+    - name: Save libaether
+      if: steps.cache-libaether-restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ github.workspace }}/libs-aether
+        key: arm64-libaether-${{ runner.os }}-${{ env.NDK_HOME }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('.git/modules/aether/HEAD') }}-${{ hashFiles('compile-aether.sh') }}
+
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        cache: false
+
+    - name: Restore cached Psiphon client
+      id: cache-psiphon-restore
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ github.workspace }}/libs-psiphon
+        key: arm64-psiphon-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('aether/psiphon-build.sh') }}-${{ hashFiles('compile-psiphon.sh') }}
+
+    - name: Build the Psiphon client
+      if: steps.cache-psiphon-restore.outputs.cache-hit != 'true'
+      run: |
+        bash compile-psiphon.sh
+
+    - name: Save the Psiphon client
+      if: steps.cache-psiphon-restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ github.workspace }}/libs-psiphon
+        key: arm64-psiphon-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('aether/psiphon-build.sh') }}-${{ hashFiles('compile-psiphon.sh') }}
+
+    - name: Restore cached pluggable transport
+      id: cache-pt-restore
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ github.workspace }}/libs-pt
+        key: arm64-pt-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('aether/pt-build.sh') }}-${{ hashFiles('compile-pt.sh') }}
+
+    - name: Build the pluggable transport
+      if: steps.cache-pt-restore.outputs.cache-hit != 'true'
+      run: |
+        bash compile-pt.sh
+
+    - name: Save the pluggable transport
+      if: steps.cache-pt-restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ github.workspace }}/libs-pt
+        key: arm64-pt-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('aether/pt-build.sh') }}-${{ hashFiles('compile-pt.sh') }}
+
+    - name: Build the Mahak engine
+      run: |
+        bash compile-mahak.sh
+
+    - name: Stage the native libraries
+      run: |
+        cp -r ${{ github.workspace }}/libs ${{ github.workspace }}/V2rayNG/app
+        cp -r ${{ github.workspace }}/libs-aether/. ${{ github.workspace }}/V2rayNG/app/libs/
+        cp -r ${{ github.workspace }}/libs-psiphon/. ${{ github.workspace }}/V2rayNG/app/libs/
+        cp -r ${{ github.workspace }}/libs-pt/. ${{ github.workspace }}/V2rayNG/app/libs/
+        cp -r ${{ github.workspace }}/libs-mahak/. ${{ github.workspace }}/V2rayNG/app/libs/
+
+    - name: Fetch the Psiphon server list
+      run: |
+        bash fetch-psiphon-servers.sh
+
+    - name: Fetch AndroidLibXrayLite tag
+      run: |
+        pushd AndroidLibXrayLite
+        CURRENT_TAG=$(git describe --tags --abbrev=0)
+        echo "Current tag in this repo: $CURRENT_TAG"
+        echo "CURRENT_TAG=$CURRENT_TAG" >> $GITHUB_ENV
+        popd
+
+    - name: Download libv2ray
+      uses: robinraju/release-downloader@v1.13
+      with:
+        repository: 'patterniha/AndroidLibXrayLite'
+        tag: ${{ env.CURRENT_TAG }}
+        fileName: 'libv2ray.aar'
+        out-file-path: V2rayNG/app/libs/
+
+    - name: Setup Java
+      uses: actions/setup-java@v6.2.0
+      with:
+        distribution: 'temurin'
+        java-version: '21'
+
+    - name: Prepare the signing key
+      env:
+        KS_B64: ${{ secrets.APP_KEYSTORE_BASE64 }}
+        KS_PASS_IN: ${{ secrets.APP_KEYSTORE_PASSWORD }}
+        KS_ALIAS_IN: ${{ secrets.APP_KEYSTORE_ALIAS }}
+        KEY_PASS_IN: ${{ secrets.APP_KEY_PASSWORD }}
+      run: |
+        if [ -n "$KS_B64" ]; then
+          printf '%s' "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          KS_PASS="$KS_PASS_IN"; KS_ALIAS="$KS_ALIAS_IN"; KEY_PASS="$KEY_PASS_IN"
+        else
+          echo "::warning::No keystore secret set: using a throwaway key, so uninstall the old app before installing each new build."
+          KS_PASS="mahak-throwaway"; KS_ALIAS="mahak"; KEY_PASS="$KS_PASS"
+          keytool -genkeypair -keystore "$RUNNER_TEMP/release.jks" -storepass "$KS_PASS" -keypass "$KEY_PASS" -alias "$KS_ALIAS" -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Mahak"
+        fi
+        echo "KS_FILE=$RUNNER_TEMP/release.jks" >> $GITHUB_ENV
+        echo "KS_PASS=$KS_PASS" >> $GITHUB_ENV
+        echo "KS_ALIAS=$KS_ALIAS" >> $GITHUB_ENV
+        echo "KEY_PASS=$KEY_PASS" >> $GITHUB_ENV
+
+    - name: Build APK (arm64-v8a)
+      run: |
+        cd ${{ github.workspace }}/V2rayNG
+        echo "sdk.dir=${ANDROID_HOME}" > local.properties
+        chmod 755 gradlew
+        ./gradlew assemblePlaystoreRelease -PABI_FILTERS=arm64-v8a -PpattngVersion="${{ inputs.release_tag }}" -Pandroid.injected.signing.store.file=$KS_FILE -Pandroid.injected.signing.store.password=$KS_PASS -Pandroid.injected.signing.key.alias=$KS_ALIAS -Pandroid.injected.signing.key.password=$KEY_PASS
+
+    - name: Check the native libraries in the APK
+      run: |
+        status=0
+        for apk in ${{ github.workspace }}/V2rayNG/app/build/outputs/apk/playstore/release/*.apk; do
+          entries=$(unzip -Z1 "$apk" | grep '^lib/' || true)
+          echo "$(basename "$apk"):"
+          echo "$entries" | sed 's/^/  /'
+          for lib in libaether.so libpsiphon-tunnel-core.so liblyrebird.so libmahak.so; do
+            echo "$entries" | grep -qx "lib/arm64-v8a/$lib" || { echo "::error::missing lib/arm64-v8a/$lib"; status=1; }
+          done
+        done
+        exit $status
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v7
+      with:
+        name: pattng-mahak-arm64-v8a
+        path: ${{ github.workspace }}/V2rayNG/app/build/outputs/apk/playstore/release/*.apk
+
+    - name: Release
+      if: inputs.release_tag != ''
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ inputs.release_tag }}
+        name: PattNG-Mahak ${{ inputs.release_tag }}
+        prerelease: true
+        files: V2rayNG/app/build/outputs/apk/playstore/release/*.apk
