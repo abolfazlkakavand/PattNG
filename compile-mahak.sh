@@ -26,3 +26,6 @@ go mod tidy
 go vet ./...
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o "$OUT/libmahak.so" .
 ls -la "$OUT/libmahak.so"
+
+# The app's own identity (package and name) is set in the same step, before Gradle runs.
+bash "$__dir/apply-mahak-identity.sh"
