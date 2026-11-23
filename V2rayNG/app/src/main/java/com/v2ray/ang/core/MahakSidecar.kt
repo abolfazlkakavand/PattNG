@@ -18,24 +18,33 @@ import java.util.concurrent.TimeUnit
  *
  * The engine takes the TLS connections Xray hands it, tries ways of sending the first ClientHello
  * that DPI does not recognise, and keeps what works on the current network. See the mahak sources.
+ *
+ * Its log lines are written at warning level on purpose: the log screen of the app hides the lower
+ * levels, and a sidecar that stays silent cannot be told from one that never started.
  */
 object MahakSidecar {
 
     const val PORT = 10850
     private const val LIB = "libmahak.so"
-    private const val LISTEN_WAIT_MS = 1500L
+    private const val LISTEN_WAIT_MS = 2500L
+    private val PORT_TEXT = Regex("\"port\"\\s*:\\s*${PORT}(\\.0)?\\b")
 
     @Volatile
     private var process: Process? = null
 
-    /** True when [content], the configuration handed to Xray, has a SOCKS outbound that dials the engine. */
+    /**
+     * True when [content], the configuration handed to Xray, has a SOCKS outbound that dials the engine.
+     * The configuration may have been read into the app's own model and written out again, so when its
+     * structure does not show the outbound, the text is searched for the address and the port.
+     */
     fun wanted(content: String): Boolean {
-        return try {
+        val structured = try {
             val outbounds = JsonParser.parseString(content).asJsonObject.get("outbounds")
             outbounds != null && outbounds.isJsonArray && outbounds.asJsonArray.any { dials(it) }
         } catch (_: Exception) {
             false
         }
+        return structured || (content.contains(AppConfig.LOOPBACK) && PORT_TEXT.containsMatchIn(content))
     }
 
     private fun hit(x: JsonObject): Boolean =
@@ -50,22 +59,39 @@ object MahakSidecar {
         return servers.any { it.isJsonObject && hit(it.asJsonObject) }
     }
 
+    private fun outboundsPreview(content: String): String = try {
+        JsonParser.parseString(content).asJsonObject.get("outbounds")?.toString()?.take(700) ?: "none"
+    } catch (e: Exception) {
+        "unreadable (${e.javaClass.simpleName})"
+    }
+
+    private fun isListening(): Boolean = try {
+        Socket().use { it.connect(InetSocketAddress(AppConfig.LOOPBACK, PORT), 100) }
+        true
+    } catch (_: Exception) {
+        false
+    }
+
     /** Starts the engine when [content] asks for it, and returns once it listens (or after a short wait). */
     @Synchronized
     fun start(context: Context, content: String) {
         stopLocked()
-        if (!wanted(content)) return
-        val bin = File(context.applicationInfo.nativeLibraryDir, LIB)
-        if (!bin.exists()) {
-            LogUtil.w(AppConfig.TAG, "Mahak: $LIB is not in this build")
+        val want = wanted(content)
+        LogUtil.w(AppConfig.TAG, "Mahak: asked for by the configuration: $want")
+        if (!want) {
+            LogUtil.w(AppConfig.TAG, "Mahak: outbounds seen: ${outboundsPreview(content)}")
             return
         }
+        val bin = File(context.applicationInfo.nativeLibraryDir, LIB)
+        LogUtil.w(AppConfig.TAG, "Mahak: program ${bin.path} exists=${bin.exists()} executable=${bin.canExecute()}")
+        if (!bin.exists()) return
         val dir = File(context.filesDir, "mahak").apply { mkdirs() }
         try {
             val builder = ProcessBuilder(
                 bin.path, "serve",
                 "-listen", "${AppConfig.LOOPBACK}:$PORT",
                 "-state", File(dir, "state.json").path,
+                "-v",
             )
             builder.environment()["HOME"] = dir.path
             // Android keeps its trusted roots in these directories; the program is a plain Linux binary.
@@ -76,15 +102,22 @@ object MahakSidecar {
             Thread({
                 try {
                     started.inputStream.bufferedReader().useLines { lines ->
-                        lines.forEach { LogUtil.i(AppConfig.TAG, "Mahak: $it") }
+                        lines.forEach { LogUtil.w(AppConfig.TAG, "Mahak: $it") }
                     }
                 } catch (_: Exception) {
                 }
             }, "mahak-log").apply { isDaemon = true }.start()
+            Thread({
+                try {
+                    val code = started.waitFor()
+                    LogUtil.w(AppConfig.TAG, "Mahak: the program ended with code $code")
+                } catch (_: InterruptedException) {
+                }
+            }, "mahak-wait").apply { isDaemon = true }.start()
             awaitListening()
-            LogUtil.i(AppConfig.TAG, "Mahak: engine started on ${AppConfig.LOOPBACK}:$PORT")
+            LogUtil.w(AppConfig.TAG, "Mahak: alive=${started.isAlive} listening=${isListening()}")
         } catch (e: Exception) {
-            LogUtil.e(AppConfig.TAG, "Mahak: could not start the engine", e)
+            LogUtil.e(AppConfig.TAG, "Mahak: could not start the program", e)
             stopLocked()
         }
     }
@@ -92,15 +125,11 @@ object MahakSidecar {
     private fun awaitListening() {
         val deadline = System.currentTimeMillis() + LISTEN_WAIT_MS
         while (System.currentTimeMillis() < deadline) {
+            if (isListening()) return
             try {
-                Socket().use { it.connect(InetSocketAddress(AppConfig.LOOPBACK, PORT), 100) }
+                Thread.sleep(50)
+            } catch (_: InterruptedException) {
                 return
-            } catch (_: Exception) {
-                try {
-                    Thread.sleep(50)
-                } catch (_: InterruptedException) {
-                    return
-                }
             }
         }
     }
