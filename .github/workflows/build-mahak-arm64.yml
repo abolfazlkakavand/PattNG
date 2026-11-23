@@ -193,6 +193,13 @@ jobs:
         distribution: 'temurin'
         java-version: '21'
 
+    - name: Restore the signing key
+      id: key-cache
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ github.workspace }}/signing/release.jks
+        key: mahak-signing-key-v1
+
     - name: Prepare the signing key
       env:
         KS_B64: ${{ secrets.APP_KEYSTORE_BASE64 }}
@@ -200,18 +207,31 @@ jobs:
         KS_ALIAS_IN: ${{ secrets.APP_KEYSTORE_ALIAS }}
         KEY_PASS_IN: ${{ secrets.APP_KEY_PASSWORD }}
       run: |
+        mkdir -p "${{ github.workspace }}/signing"
+        KS_FILE="${{ github.workspace }}/signing/release.jks"
         if [ -n "$KS_B64" ]; then
-          printf '%s' "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          printf '%s' "$KS_B64" | base64 -d > "$KS_FILE"
           KS_PASS="$KS_PASS_IN"; KS_ALIAS="$KS_ALIAS_IN"; KEY_PASS="$KEY_PASS_IN"
         else
-          echo "::warning::No keystore secret set: using a throwaway key, so uninstall the old app before installing each new build."
-          KS_PASS="mahak-throwaway"; KS_ALIAS="mahak"; KEY_PASS="$KS_PASS"
-          keytool -genkeypair -keystore "$RUNNER_TEMP/release.jks" -storepass "$KS_PASS" -keypass "$KEY_PASS" -alias "$KS_ALIAS" -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Mahak"
+          KS_PASS="mahak-signing"; KS_ALIAS="mahak"; KEY_PASS="$KS_PASS"
+          if [ -f "$KS_FILE" ]; then
+            echo "Using the signing key kept from an earlier build: updates install over the old app."
+          else
+            echo "::warning::Made a new signing key. This build must be installed after uninstalling the old app; later builds reuse the key and update in place."
+            keytool -genkeypair -keystore "$KS_FILE" -storepass "$KS_PASS" -keypass "$KEY_PASS" -alias "$KS_ALIAS" -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Mahak"
+          fi
         fi
-        echo "KS_FILE=$RUNNER_TEMP/release.jks" >> $GITHUB_ENV
+        echo "KS_FILE=$KS_FILE" >> $GITHUB_ENV
         echo "KS_PASS=$KS_PASS" >> $GITHUB_ENV
         echo "KS_ALIAS=$KS_ALIAS" >> $GITHUB_ENV
         echo "KEY_PASS=$KEY_PASS" >> $GITHUB_ENV
+
+    - name: Keep the signing key for the next build
+      if: steps.key-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ github.workspace }}/signing/release.jks
+        key: mahak-signing-key-v1
 
     - name: Build APK (arm64-v8a)
       run: |
